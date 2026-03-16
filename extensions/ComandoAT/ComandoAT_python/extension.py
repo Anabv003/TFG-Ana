@@ -10,8 +10,6 @@ import carb.events
 import omni.timeline
 import omni.physx
 
-
-from .controller_logic import ControllerLogic
 from navsim_utils.extensions_utils import ExtensionUtils
 
 
@@ -74,6 +72,7 @@ class ManualController(omni.ext.IExt):
             name="Plots_building"
         )
 
+#Interfaz
     def build_ui(self):
         # The ui.RasterPolicy.NEVER is to always update plots line drawing
         self.window = ui.Window(
