@@ -10,10 +10,19 @@ import carb.events
 import omni.timeline
 import omni.physx
 
+import numpy as np
+
+from isaacsim.core.prims import Articulation
+from isaacsim.core.prims import RigidPrim
 from navsim_utils.extensions_utils import ExtensionUtils
+import numpy as np
+
+from isaacsim.core.prims import Articulation
+from isaacsim.core.prims import RigidPrim
 
 
-class ManualController(omni.ext.IExt):
+
+class AT_Comando(omni.ext.IExt):
     def on_startup(self, ext_id):
         self.init_vars()
         self.build_ui()
@@ -25,6 +34,13 @@ class ManualController(omni.ext.IExt):
         self.on_physics_step_sub = None
         self.on_stop_sub = None
         self.plots_update_sub = None
+
+    def joints(self):
+        self.articulations = Articulation(
+            prim_paths_expr=["/root"]
+
+        )
+        self.articulations.initialize()
 
     def on_physics_step(self, step_size:int):
         self.current_time += step_size
@@ -45,6 +61,14 @@ class ManualController(omni.ext.IExt):
         self.stop_update_plot = True
         self.manual_control = ControllerLogic(self.event_stream, self.operator_uav_event)
 
+        self.joints()
+        self.rotor_angles = {"JRotorAD":0.0, "JRotorMD":0.0, "JRotorFD":0.0, "JRotorAI":0.0, "JRotorMI":0.0,"JRotorFI":0.0}
+        self.rotor_sliders ={}
+        self.rotor_indices = {"JRotorAD":0, "JRotorMD":1, "JRotorFD":2, "JRotorAI":3, "JRotorMI":4,"JRotorFI":5}
+        
+        self.palas_vel = {"JPalasAD":0.0, "JPalasMD":0.0, "JPalasFD":0.0, "JPalasAI":0.0, "JPalasMI":0.0,"JPalasFI":0.0}
+        self.palas_sliders = {}
+        self.palas_indices = {"JPalasAD":0, "JPalasMD":1, "JPalasFD":2, "JPalasAI":3, "JPalasMI":4,"JPalasFI":0.0}
         self.physx_interface = omni.physx.get_physx_interface()
         self.on_physics_step_sub = self.physx_interface.subscribe_physics_step_events(
             self.on_physics_step
@@ -76,7 +100,7 @@ class ManualController(omni.ext.IExt):
     def build_ui(self):
         # The ui.RasterPolicy.NEVER is to always update plots line drawing
         self.window = ui.Window(
-            "MC: NavSim - Manual Controller", 
+            "AT - Manual Control", 
             width=600, 
             height=600, 
             raster_policy=ui.RasterPolicy.NEVER
@@ -87,26 +111,24 @@ class ManualController(omni.ext.IExt):
                 with ui.VStack(spacing=10, height=0):
                     ui.Spacer(height=10)
 
-                    # UAV selector dropdown
-                    ui.Label("Select UAV:")
-                    self.UAV_dropdown: ui.ComboBox = self.ext_utils.build_uav_selector()
-                    self.UAV_dropdown.model.add_item_changed_fn(
-                        self.change_uav_subject
-                    )
-
-                    ui.Spacer(height=10)
-
-                    # Controls power
-                    self.controls_power = ui.CollapsableFrame(
-                        title="Control", 
+                    # # UAV selector dropdown
+                    # ui.Label("Select UAV:")
+                    # self.UAV_dropdown: ui.ComboBox = self.ext_utils.build_uav_selector()
+                    # self.UAV_dropdown.model.add_item_changed_fn(
+                    #     self.change_uav_subject
+                    # )
+                    
+                    #Poner cada rotor un ángulo diferente
+                    self.rotors_angle = ui.CollapsableFrame(
+                        title="Rotors", 
                         collapsed=False
                     )
 
-                    with self.controls_power:
+                    with self.rotors_angle:
                         with ui.VStack(style={"margin": 1}, height=0, spacing=5):
                             # Linear velocity Max
                             with ui.HStack(alignment=ui.Alignment.RIGHT):
-                                ui.Label("Linear velocity Max")
+                                ui.Label("Rotors angle")
                                 self.linear_vel_power = ui.FloatSlider(
                                     min=0.5, 
                                     max=10, 
@@ -120,7 +142,7 @@ class ManualController(omni.ext.IExt):
                                 )
                                 self.linear_vel_power.model.set_value(1)
                                 self.linear_vel_power.model.add_value_changed_fn(
-                                    self.on_linear_vel_power_change
+                                    self.joints
                                 )
 
                             # Angular velocity Max
@@ -164,15 +186,15 @@ class ManualController(omni.ext.IExt):
                             )
 
 
-                    # Controls ploting
-                    self.controls_ploting = ui.CollapsableFrame(
-                        title="Visualization", 
-                        collapsed=False
-                    )
+                    # # Controls ploting
+                    # self.controls_ploting = ui.CollapsableFrame(
+                    #     title="Visualization", 
+                    #     collapsed=False
+                    # )
 
-                    with self.controls_ploting:
-                        self.plots_container = ui.VStack(height=0)
-                        self.build_plot_container_content()
+                    # with self.controls_ploting:
+                    #     self.plots_container = ui.VStack(height=0)
+                    #     self.build_plot_container_content()
 
     def change_uav_subject(self, m, i):
         # Check if custom camera exists
@@ -197,18 +219,18 @@ class ManualController(omni.ext.IExt):
             self.manual_control.stop()
             self.manual_control.start(uav)
 
-    def on_linear_vel_power_change(self, model):
-        # Get and set new limit
-        self.linear_vel_limit = model.get_value_as_float()
-        self.manual_control.linear_vel_limit = self.linear_vel_limit
+    # def on_linear_vel_power_change(self, model):
+    #     # Get and set new limit
+    #     self.linear_vel_limit = model.get_value_as_float()
+    #     self.manual_control.linear_vel_limit = self.linear_vel_limit
 
-        self.update_ui_linear_vel_limits()
+    #     self.update_ui_linear_vel_limits()
 
-    def on_angular_vel_power_change(self, model):
-        self.angular_vel_limit = model.get_value_as_float()
-        self.manual_control.ang_vel_limit = self.angular_vel_limit
+    # def on_angular_vel_power_change(self, model):
+    #     self.angular_vel_limit = model.get_value_as_float()
+    #     self.manual_control.ang_vel_limit = self.angular_vel_limit
 
-        self.update_ui_angular_vel_limits()
+    #     self.update_ui_angular_vel_limits()
     
     def on_invert_camera_mov_change(self, model):
         self.manual_control.invert_camera_movement = model.get_value_as_bool()
@@ -369,29 +391,29 @@ class ManualController(omni.ext.IExt):
         # Start the coroutine that updates the plots
         asyncio.ensure_future(self.update_plot())
 
-    def update_ui_linear_vel_limits(self):
-        # Update linear velocity limit labels
-        self.x_max_lvl.text = str(self.linear_vel_limit)
-        if not self.TRDW:
-            self.y_max_lvl.text = str(self.linear_vel_limit)
-            self.z_max_lvl.text = str(self.linear_vel_limit)
+    # def update_ui_linear_vel_limits(self):
+    #     # Update linear velocity limit labels
+    #     self.x_max_lvl.text = str(self.linear_vel_limit)
+    #     if not self.TRDW:
+    #         self.y_max_lvl.text = str(self.linear_vel_limit)
+    #         self.z_max_lvl.text = str(self.linear_vel_limit)
 
-        self.x_min_lvl.text = str(-self.linear_vel_limit)
-        if not self.TRDW:
-            self.y_min_lvl.text = str(-self.linear_vel_limit)
-            self.z_min_lvl.text = str(-self.linear_vel_limit)
+    #     self.x_min_lvl.text = str(-self.linear_vel_limit)
+    #     if not self.TRDW:
+    #         self.y_min_lvl.text = str(-self.linear_vel_limit)
+    #         self.z_min_lvl.text = str(-self.linear_vel_limit)
 
-        # Adjust scale to corresponding control power
-        self.x_lv_plot.scale_min = -self.linear_vel_limit
-        self.x_lv_plot.scale_max = self.linear_vel_limit
+    #     # Adjust scale to corresponding control power
+    #     self.x_lv_plot.scale_min = -self.linear_vel_limit
+    #     self.x_lv_plot.scale_max = self.linear_vel_limit
         
-        self.y_lv_plot.scale_min = -self.linear_vel_limit
-        self.y_lv_plot.scale_max = self.linear_vel_limit
+    #     self.y_lv_plot.scale_min = -self.linear_vel_limit
+    #     self.y_lv_plot.scale_max = self.linear_vel_limit
 
-        self.z_lv_plot.scale_min = -self.linear_vel_limit
-        self.z_lv_plot.scale_max = self.linear_vel_limit
+    #     self.z_lv_plot.scale_min = -self.linear_vel_limit
+    #     self.z_lv_plot.scale_max = self.linear_vel_limit
 
-    def update_ui_angular_vel_limits(self):
+    # def update_ui_angular_vel_limits(self):
         # Update angular velocity limit labels
         self.z_max_avl.text = str(self.angular_vel_limit)
         self.z_min_avl.text = str(-self.angular_vel_limit)
