@@ -21,6 +21,7 @@ import numpy as np
 class AT_Comando(omni.ext.IExt):
     def on_startup(self, ext_id):
         self.init_vars()
+        self.joints()
         self.build_ui()
 
     def on_shutdown(self):
@@ -33,9 +34,17 @@ class AT_Comando(omni.ext.IExt):
     def joints(self):
         self.articulations = Articulation(
             prim_paths_expr=["/root"]
-
         )
         self.articulations.initialize()
+
+        self.joint_names =list(self.articulations.joint_names)
+        self.joint_name_to_index = {name: i for i, name in enumerate(self.joint_names)}
+        self.rotor_joint_names = [name for name in self.joint_names if name.startswith("JRotor")]
+        self.palas_joint_names = [name for name in self.joint_names if name.startswith("JPalas")]
+
+        self.rotor_angles = {name : 0.0 for name in self.rotor_joint_names}
+        self.palas_vel = {name : 0.0 for name in self.palas_joint_names}
+
 
     def on_physics_step(self, step_size:int):
         self.current_time += step_size
@@ -54,18 +63,22 @@ class AT_Comando(omni.ext.IExt):
         self.current_time = 0
         self.stop_update_plot = True
 
-        self.joints()
-        self.rotor_angles = {"JRotorAD":0.0, "JRotorMD":0.0, "JRotorFD":0.0, "JRotorAI":0.0, "JRotorMI":0.0,"JRotorFI":0.0}
-        self.rotor_sliders ={}
-        self.rotor_indices = {"JRotorAD":0, "JRotorMD":1, "JRotorFD":2, "JRotorAI":3, "JRotorMI":4,"JRotorFI":5}
-        
-        self.palas_vel = {"JPalasAD":0.0, "JPalasMD":0.0, "JPalasFD":0.0, "JPalasAI":0.0, "JPalasMI":0.0,"JPalasFI":0.0}
+        self.articulations = None
+        self.joint_names = []
+        self.joint_name_to_index = {}
+
+        self.rotor_joint_names = []
+        self.palas_joint_names = []
+
+        self.rotor_angles = {}
+        self.palas_vel = {}
+
+        self.rotor_sliders = {}
         self.palas_sliders = {}
-        self.palas_indices = {"JPalasAD":0, "JPalasMD":1, "JPalasFD":2, "JPalasAI":3, "JPalasMI":4,"JPalasFI":0.0}
+
+        self.current_joint_positions = None
+        
         self.physx_interface = omni.physx.get_physx_interface()
-        # self.on_physics_step_sub = self.physx_interface.subscribe_physics_step_events(
-        #     self.on_physics_step
-        # )
 
         self.timeline = omni.timeline.get_timeline_interface()
         timeline_stream = self.timeline.get_timeline_event_stream()
@@ -73,22 +86,6 @@ class AT_Comando(omni.ext.IExt):
             int(omni.timeline.TimelineEventType.STOP), 
             self.on_stop
         )
-
-        # # Plot data
-        # self.x_lv_plot_data = [0.0, 0.0]
-        # self.y_lv_plot_data = [0.0, 0.0]
-        # self.z_lv_plot_data = [0.0, 0.0]
-        # self.z_av_plot_data = [0.0, 0.0]
-
-        # # Plots appereance
-        # self.plots_appearance = 1
-        # self.build_plots = False
-        # update_event_stream = omni.kit.app.get_app_interface().get_update_event_stream()
-        # self.plots_update_sub = update_event_stream.create_subscription_to_pop(
-        #     self.build_plots_container, 
-        #     name="Plots_building"
-        # )
-
 #Interfaz
     def build_ui(self):
         # The ui.RasterPolicy.NEVER is to always update plots line drawing
@@ -136,10 +133,6 @@ class AT_Comando(omni.ext.IExt):
 
                                     self.rotor_sliders[rotor_name] = slider
 
-                            # On/Off init rotors
-                            with ui.HStack(alignment=ui.Alignment.RIGHT):
-                                ui.Label("Start with rotors on")
-                                self.start_rotors_on_off_checkbox = ui.CheckBox(width=0)
 
                             ui.Spacer(height=15)
 
@@ -151,13 +144,11 @@ class AT_Comando(omni.ext.IExt):
         self.apply_rotor_angle(rotor_name, value)
 
     def apply_rotor_angle(self, rotor_name, angle_deg):
-        idx = self.rotor_indices[rotor_name]
-        # Convertir a radianes
-        angle_rad = np.deg2rad(angle_deg)
-        # Obtener posiciones actuales
-        joint_positions = self.articulations.get_joint_positions()
-        # Modificar solo ese rotor
-        joint_positions[idx] = angle_rad
-        # Aplicar
-        self.articulations.set_joint_positions(joint_positions)
+        idx = self.articulations.get_joint_index(rotor_name)
 
+        angle_rad = np.deg2rad(angle_deg)
+
+        self.articulations.set_joint_positions(
+            positions=np.array([angle_rad]),
+            joint_indices=np.array([idx])
+        )
