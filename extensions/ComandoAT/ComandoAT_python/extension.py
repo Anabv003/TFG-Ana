@@ -149,7 +149,7 @@ class AT_Comando(omni.ext.IExt):
                                     slider = ui.FloatSlider(
                                         min=-120, 
                                         max=120,
-                                        step=1,
+                                        step=2,
                                         precision=1,
                                         style={
                                             "background_color": ui.color(0.13),
@@ -173,6 +173,15 @@ class AT_Comando(omni.ext.IExt):
         self.rotor_angles[rotor_name] = value
         # Aplicar al joint
         self.apply_rotor_angle(rotor_name, value)
+
+    # def on_rotor_change(self, model, rotor_name):
+    #     raw = model.get_value_as_float()
+
+    #     # invertir
+    #     value = 90 - raw
+
+    #     self.rotor_angles[rotor_name] = value
+    #     self.apply_rotor_angle(rotor_name, value)
 
     def apply_rotor_angle(self, rotor_name, angle_deg):
         idx = self.articulations.get_joint_index(rotor_name)
