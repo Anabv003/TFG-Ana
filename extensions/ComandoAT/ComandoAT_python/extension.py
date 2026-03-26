@@ -21,7 +21,7 @@ import numpy as np
 class AT_Comando(omni.ext.IExt):
     def on_startup(self, ext_id):
         self.init_vars()
-        self.joints()
+        #self.joints()
         self.build_ui()
 
     # def on_shutdown(self):
@@ -42,12 +42,12 @@ class AT_Comando(omni.ext.IExt):
         self.rotor_angles = {name : 0.0 for name in self.rotor_joint_names}
         self.blade_speed = {name : 0.0 for name in self.blade_joint_names}
 
-    # def on_timeline_play(self, event):
-    #     if not self.is_simulation_running:
-    #         self.joints()
-    #         self.is_simulation_running = True
+    def on_timeline_play(self, event):
+        if not self.is_simulation_running:
+            self.joints()
+            self.is_simulation_running = True
     
-    # def on_timeline_stop(self, event):
+    def on_timeline_stop(self, event):
         if self.is_simulation_running:
             self.articulations = None 
             self.is_simulation_running = False
@@ -60,8 +60,8 @@ class AT_Comando(omni.ext.IExt):
         self.joint_names = []
         self.joint_name_to_index = {}
 
-        self.rotor_joint_names = []
-        self.blade_joint_names = []
+        self.rotor_joint_names = ["JRotorNW","JRotorNE","JRotorW","JRotorE","JRotorSW","JRotorSE"]
+        self.blade_joint_names = ["JBladeNW","JBladeNE","JBladeW","JBladeE","JBladeSW","JBladeSE"]
 
         self.rotor_angles = {}
         self.blade_speed = {}
@@ -71,19 +71,19 @@ class AT_Comando(omni.ext.IExt):
 
         self.current_joint_positions = None
 
-        #  # Timeline callbacks
-        # self.timeline = omni.timeline.get_timeline_interface()
-        # timeline_stream = self.timeline.get_timeline_event_stream()
+         # Timeline callbacks
+        self.timeline = omni.timeline.get_timeline_interface()
+        timeline_stream = self.timeline.get_timeline_event_stream()
 
-        # self.on_stop_sub = timeline_stream.create_subscription_to_pop_by_type(
-        #     int(omni.timeline.TimelineEventType.STOP), 
-        #     self.on_timeline_stop
-        # )
+        self.on_stop_sub = timeline_stream.create_subscription_to_pop_by_type(
+            int(omni.timeline.TimelineEventType.STOP), 
+            self.on_timeline_stop
+        )
 
-        # self.on_play_sub = timeline_stream.create_subscription_to_pop_by_type(
-        #     int(omni.timeline.TimelineEventType.PLAY), 
-        #     self.on_timeline_play
-        # )
+        self.on_play_sub = timeline_stream.create_subscription_to_pop_by_type(
+            int(omni.timeline.TimelineEventType.PLAY), 
+            self.on_timeline_play
+        )
 
     def build_ui(self):
         # The ui.RasterPolicy.NEVER is to always update plots line drawing
@@ -107,13 +107,13 @@ class AT_Comando(omni.ext.IExt):
 
                     with self.rotors_angle:
                         with ui.VStack(style={"margin": 1}, height=0, spacing=5):
-                            for rotor_name in self.rotor_angles.keys():
+                            for name in self.rotor_joint_names:
                                 with ui.HStack(alignment=ui.Alignment.RIGHT):
-                                    ui.Label(rotor_name)
-
+                                    ui.Label(name)
+                                    
                                     slider = ui.FloatSlider(
                                         min=0, 
-                                        max=90,
+                                        max=120,
                                         step=1,
                                         precision=1,
                                         style={
@@ -126,10 +126,10 @@ class AT_Comando(omni.ext.IExt):
                                     slider.model.set_value(0.0)
                                     slider.model.add_value_changed_fn(
                                         lambda model,
-                                        name=rotor_name: self.on_rotor_change(model, name)
+                                        name=name: self.on_rotor_change(model, name)
                                     )
 
-                                    self.rotor_sliders[rotor_name] = slider
+                                    self.rotor_sliders[name] = slider
 
 
                             ui.Spacer(height=15)
@@ -142,12 +142,12 @@ class AT_Comando(omni.ext.IExt):
 
                     with self.blade_speeds:
                         with ui.VStack(style={"margin": 1}, height=0, spacing=5):
-                            for blade_name in self.blade_speed.keys():
+                            for blade_name in self.blade_joint_names:
                                 with ui.HStack(alignment=ui.Alignment.RIGHT):
                                     ui.Label(blade_name)
-
+                                    
                                     slider = ui.FloatSlider(
-                                        min=-120, 
+                                        min=0, 
                                         max=120,
                                         step=2,
                                         precision=1,
@@ -157,7 +157,6 @@ class AT_Comando(omni.ext.IExt):
                                             "draw_mode": ui.SliderDrawMode.FILLED
                                         }
                                     )
-
                                     slider.model.set_value(0.0)
                                     slider.model.add_value_changed_fn(
                                         lambda model,
@@ -166,39 +165,33 @@ class AT_Comando(omni.ext.IExt):
 
                                     self.blase_sliders[blade_name] = slider
 
-
     def on_rotor_change(self, model, rotor_name):
-        value = model.get_value_as_float()
-        # Guardar valor
-        self.rotor_angles[rotor_name] = value
+        if self.articulations is None:
+            return
+        print(self.articulations.joint_names)
+
+        value = model.get_value_as_float() * (-1)
         # Aplicar al joint
         self.apply_rotor_angle(rotor_name, value)
-
-    # def on_rotor_change(self, model, rotor_name):
-    #     raw = model.get_value_as_float()
-
-    #     # invertir
-    #     value = 90 - raw
-
-    #     self.rotor_angles[rotor_name] = value
-    #     self.apply_rotor_angle(rotor_name, value)
 
     def apply_rotor_angle(self, rotor_name, angle_deg):
         idx = self.articulations.get_joint_index(rotor_name)
 
         angle_rad = np.deg2rad(angle_deg)
 
-        # self.articulations.set_joint_positions(
-        #     positions=np.array([angle_rad]),
-        #     joint_indices=np.array([idx])
-        # )
         self.articulations.set_joint_position_targets(
             positions=np.array([angle_rad]),
             joint_indices=np.array([idx])
         )
 
     def on_blade_change(self, model, blade_name):
-        value = model.get_value_as_float()
+        if self.articulations is None:
+            return
+        
+        if blade_name in ["JBladeSE","JBladeNW","JBladeE"]:
+            value = model.get_value_as_float() 
+        else: 
+            value = model.get_value_as_float() * (-1)
         # Guardar valor
         self.blade_speed[blade_name] = value
         # Aplicar al joint
@@ -207,15 +200,8 @@ class AT_Comando(omni.ext.IExt):
     def apply_blade_vel(self, blade_name, vel):
         idx = self.articulations.get_joint_index(blade_name)
 
-        #angle_rad = np.deg2rad(angle_deg)
-
         self.articulations.set_joint_velocity_targets(
             velocities =np.array([vel]),
             joint_indices=np.array([idx])
         )
-        # self.articulations.set_joint_position_targets(
-        #     positions=np.array([1.57,1.57,1.57,1.57,1.57,1.57]),
-        #     joint_indices=range(6, 12)
-        # )
-
 
