@@ -21,11 +21,16 @@ import numpy as np
 class AT_Comando(omni.ext.IExt):
     def on_startup(self, ext_id):
         self.init_vars()
-        #self.joints()
         self.build_ui()
 
     # def on_shutdown(self):
     #     pass
+
+    def init_rigid_prim(self):
+        self.rigid_prim = RigidPrim (
+            prim_paths_expr=["/root/Fuselage"]
+        )
+        self.rigid_prim.initialize()
 
     def joints(self):
 
@@ -34,23 +39,17 @@ class AT_Comando(omni.ext.IExt):
         )
         self.articulations.initialize()
 
-        self.joint_names =list(self.articulations.joint_names)
-        self.joint_name_to_index = {name: i for i, name in enumerate(self.joint_names)}
-        self.rotor_joint_names = [name for name in self.joint_names if name.startswith("JRotor")]
-        self.blade_joint_names = [name for name in self.joint_names if name.startswith("JPalas")]
-
-        self.rotor_angles = {name : 0.0 for name in self.rotor_joint_names}
-        self.blade_speed = {name : 0.0 for name in self.blade_joint_names}
-
     def on_timeline_play(self, event):
         if not self.is_simulation_running:
             self.joints()
+            self.init_rigid_prim()
             self.is_simulation_running = True
     
     def on_timeline_stop(self, event):
         if self.is_simulation_running:
             self.articulations = None 
             self.is_simulation_running = False
+            self.rigid_prim= None
 
     def init_vars(self):
 
@@ -67,11 +66,20 @@ class AT_Comando(omni.ext.IExt):
         self.blade_speed = {}
 
         self.rotor_sliders = {}
-        self.blase_sliders = {}
+        self.blade_sliders = {}
+        self.force_fields = {}
 
         self.current_joint_positions = None
 
-         # Timeline callbacks
+        #X, Y, Z
+        self.pos_blades= [[2.0702, 2.33, 0.8330], #BladeNW
+                          [2.0702, -2.33, 0.8330],#BladeNE
+                          [0.4266,5.301,0.5895],#BladeW
+                          [0.4266,-5.301,0.5895],#BladeE
+                          [-2.6278,2.33,1.4674],#BladeSW
+                          [-2.6278,-2.33,1.467413]]#BladeSE
+ 
+        # Timeline callbacks
         self.timeline = omni.timeline.get_timeline_interface()
         timeline_stream = self.timeline.get_timeline_event_stream()
 
@@ -102,9 +110,8 @@ class AT_Comando(omni.ext.IExt):
                     #Poner cada rotor un ángulo diferente
                     self.rotors_angle = ui.CollapsableFrame(
                         title="Rotors Angles", 
-                        collapsed=False
+                        collapsed=True
                     )
-
                     with self.rotors_angle:
                         with ui.VStack(style={"margin": 1}, height=0, spacing=5):
                             for name in self.rotor_joint_names:
@@ -113,7 +120,7 @@ class AT_Comando(omni.ext.IExt):
                                     
                                     slider = ui.FloatSlider(
                                         min=0, 
-                                        max=120,
+                                        max=100,
                                         step=1,
                                         precision=1,
                                         style={
@@ -137,9 +144,8 @@ class AT_Comando(omni.ext.IExt):
                     #Poner cada pala a una velocidad diferente
                     self.blade_speeds = ui.CollapsableFrame(
                         title="Blade Speed", 
-                        collapsed=False
+                        collapsed=True
                     )
-
                     with self.blade_speeds:
                         with ui.VStack(style={"margin": 1}, height=0, spacing=5):
                             for blade_name in self.blade_joint_names:
@@ -163,13 +169,36 @@ class AT_Comando(omni.ext.IExt):
                                         name=blade_name: self.on_blade_change(model, name)
                                     )
 
-                                    self.blase_sliders[blade_name] = slider
+                                    self.blade_sliders[blade_name] = slider
+                    
+                    self.blade_forces = ui.CollapsableFrame(
+                        title="Blade Force", 
+                        collapsed=False
+                    )
+
+                    with self.blade_forces:
+                        with ui.VStack(style={"margin": 1}, height=0, spacing=5):
+                            for blade_name in self.blade_joint_names:
+                                with ui.HStack(alignment=ui.Alignment.RIGHT):
+                                    ui.Label(blade_name)
+                                    
+                                    self.force_fields[blade_name] = ui.FloatField(
+                                        style={
+                                            "background_color": ui.color(0.13),
+                                            "secondary_color": ui.color(0.3)
+                                        }
+                                    
+                                    )
+                                    self.force_fields[blade_name].model.set_value(3300)
+                            
+                            #Añadir botón
+                            force_send_button = ui.Button(clicked_fn = self.send_forces, text = "Send forces")
+
+                            
 
     def on_rotor_change(self, model, rotor_name):
         if self.articulations is None:
             return
-        print(self.articulations.joint_names)
-
         value = model.get_value_as_float() * (-1)
         # Aplicar al joint
         self.apply_rotor_angle(rotor_name, value)
@@ -205,3 +234,29 @@ class AT_Comando(omni.ext.IExt):
             joint_indices=np.array([idx])
         )
 
+    def send_forces(self):
+        bodies_forces = np.zeros((6, 3))
+        
+        #Fuerzas de cada joint
+        for i, name  in enumerate(self.blade_joint_names) : 
+            bodies_forces[i, 2] =  self.force_fields[name].model.get_value_as_float()
+
+        forces_to_apply = np.sum(
+            bodies_forces,
+            axis = 0
+        )
+        
+        torques_to_apply = np.sum(
+            np.cross(self.pos_blades, bodies_forces), axis=0
+        )
+
+        print("Forces:", forces_to_apply)
+        print("Torques :", torques_to_apply)
+        
+        if self.is_simulation_running:
+            self.rigid_prim.apply_forces_and_torques_at_pos(
+                forces = forces_to_apply,
+                torques= torques_to_apply,
+                is_global=False,
+                indices=[0]
+            )
