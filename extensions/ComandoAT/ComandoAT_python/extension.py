@@ -48,8 +48,14 @@ class AT_Comando(omni.ext.IExt):
     def on_timeline_stop(self, event):
         if self.is_simulation_running:
             self.articulations = None 
+            if self._physx_sub is not None:
+                self._physx_sub.unsubscribe()
+                self._physx_sub = None
             self.is_simulation_running = False
             self.rigid_prim= None
+
+            self.forces_to_apply = [0,0,0]
+            self.torques_to_apply = [0,0,0]
 
     def init_vars(self):
 
@@ -65,6 +71,9 @@ class AT_Comando(omni.ext.IExt):
         self.rotor_angles = {}
         self.blade_speed = {}
 
+        self.forces_to_apply = [0,0,0]
+        self.torques_to_apply = [0,0,0]
+        self._physx_sub = None
         self.rotor_sliders = {}
         self.blade_sliders = {}
         self.force_fields = {}
@@ -78,7 +87,12 @@ class AT_Comando(omni.ext.IExt):
                           [0.4266,-5.301,0.5895],#BladeE
                           [-2.6278,2.33,1.4674],#BladeSW
                           [-2.6278,-2.33,1.467413]]#BladeSE
- 
+
+        # Phyxs callback
+        self.physx_sub = omni.physx.acquire_physx_interface().subscribe_physics_step_events(
+            self.on_physics_step
+        )
+
         # Timeline callbacks
         self.timeline = omni.timeline.get_timeline_interface()
         timeline_stream = self.timeline.get_timeline_event_stream()
@@ -110,7 +124,7 @@ class AT_Comando(omni.ext.IExt):
                     #Poner cada rotor un ángulo diferente
                     self.rotors_angle = ui.CollapsableFrame(
                         title="Rotors Angles", 
-                        collapsed=True
+                        collapsed=False
                     )
                     with self.rotors_angle:
                         with ui.VStack(style={"margin": 1}, height=0, spacing=5):
@@ -241,22 +255,19 @@ class AT_Comando(omni.ext.IExt):
         for i, name  in enumerate(self.blade_joint_names) : 
             bodies_forces[i, 2] =  self.force_fields[name].model.get_value_as_float()
 
-        forces_to_apply = np.sum(
-            bodies_forces,
-            axis = 0
+        self.forces_to_apply = np.sum(
+            bodies_forces, axis = 0
         )
-        
-        torques_to_apply = np.sum(
+        # self.pos_blades = np.array(self.pos_blades, dtype=np.float32)
+        self.torques_to_apply = np.sum(
             np.cross(self.pos_blades, bodies_forces), axis=0
         )
-
-        print("Forces:", forces_to_apply)
-        print("Torques :", torques_to_apply)
         
+            
+    def on_physics_step(self, dt):
         if self.is_simulation_running:
             self.rigid_prim.apply_forces_and_torques_at_pos(
-                forces = forces_to_apply,
-                torques= torques_to_apply,
-                is_global=False,
-                indices=[0]
+                forces=self.forces_to_apply,
+                torques=self.torques_to_apply,
+                is_global=False
             )

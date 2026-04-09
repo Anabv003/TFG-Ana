@@ -12,8 +12,8 @@ repository = ""
 keywords = ["controller", "UAV", "Drone"]
 changelog="docs/CHANGELOG.md"
 readme  = "docs/README.md"
-preview_image = "data/preview.png"
-icon = "data/icon.png"
+
+icon = "data/icon.jpeg"
 
 [dependencies]
 "omni.kit.uiapp" = {}
