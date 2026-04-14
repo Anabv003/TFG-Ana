@@ -28,7 +28,7 @@ class AT_Comando(omni.ext.IExt):
 
     def init_rigid_prim(self):
         self.rigid_prim = RigidPrim (
-            prim_paths_expr=["/root/Fuselage"]
+            prim_paths_expr=["/root/Blade*"]
         )
         self.rigid_prim.initialize()
 
@@ -38,6 +38,8 @@ class AT_Comando(omni.ext.IExt):
             prim_paths_expr=["/root"]
         )
         self.articulations.initialize()
+
+        print(self.articulations.joint_names)
 
     def on_timeline_play(self, event):
         if not self.is_simulation_running:
@@ -81,12 +83,19 @@ class AT_Comando(omni.ext.IExt):
         self.current_joint_positions = None
 
         #X, Y, Z
-        self.pos_blades= [[2.0702, 2.33, 0.8330], #BladeNW
-                          [2.0702, -2.33, 0.8330],#BladeNE
-                          [0.4266,5.301,0.5895],#BladeW
-                          [0.4266,-5.301,0.5895],#BladeE
-                          [-2.6278,2.33,1.4674],#BladeSW
-                          [-2.6278,-2.33,1.467413]]#BladeSE
+        self.pos_blades= [[5.9732, 2.33, 1.8101], #BladeNW
+                          [5.9732, -2.33, 1.8101],#BladeNE
+                          [4.1579,5.3019,1.8036],#BladeW
+                          [4.1579,-5.3019,1.8036],#BladeE
+                          [1.216,2.33,2.539],#BladeSW
+                          [1.216,-2.33,2.539]]#BladeSE
+        
+        self.pos_rotor = [[5.9768, 2.33, 1.3128], #RotorNW
+                          [5.9768, -2.33, 1.3128],#RotorNE
+                          [4.1288,5.3645,1.019],#RotorW
+                          [4.1288,-5.3645,1.019],#RotorE
+                          [1.2019,2.33,1.9648],#RotorSW
+                          [1.2019,-2.33,1.9648]]#RotorSE
 
         # Phyxs callback
         self.physx_sub = omni.physx.acquire_physx_interface().subscribe_physics_step_events(
@@ -151,9 +160,8 @@ class AT_Comando(omni.ext.IExt):
                                     )
 
                                     self.rotor_sliders[name] = slider
-
-
-                            ui.Spacer(height=15)
+                            button_90 = ui.Button(clicked_fn = self.set_ninety, text = "Set 90 degrees")
+                            button_0 = ui.Button(clicked_fn = self.set_zero, text = "Set 0 degrees")
 
                     #Poner cada pala a una velocidad diferente
                     self.blade_speeds = ui.CollapsableFrame(
@@ -189,7 +197,6 @@ class AT_Comando(omni.ext.IExt):
                         title="Blade Force", 
                         collapsed=False
                     )
-
                     with self.blade_forces:
                         with ui.VStack(style={"margin": 1}, height=0, spacing=5):
                             for blade_name in self.blade_joint_names:
@@ -203,12 +210,10 @@ class AT_Comando(omni.ext.IExt):
                                         }
                                     
                                     )
-                                    self.force_fields[blade_name].model.set_value(3300)
+                                    self.force_fields[blade_name].model.set_value(3500)
                             
                             #Añadir botón
                             force_send_button = ui.Button(clicked_fn = self.send_forces, text = "Send forces")
-
-                            
 
     def on_rotor_change(self, model, rotor_name):
         if self.articulations is None:
@@ -218,6 +223,7 @@ class AT_Comando(omni.ext.IExt):
         self.apply_rotor_angle(rotor_name, value)
 
     def apply_rotor_angle(self, rotor_name, angle_deg):
+        
         idx = self.articulations.get_joint_index(rotor_name)
 
         angle_rad = np.deg2rad(angle_deg)
@@ -226,6 +232,40 @@ class AT_Comando(omni.ext.IExt):
             positions=np.array([angle_rad]),
             joint_indices=np.array([idx])
         )
+
+    def set_ninety(self):
+        if self.is_simulation_running:
+            positions = np.array([
+                np.deg2rad(-90),
+                np.deg2rad(-90),
+                np.deg2rad(-90),
+                np.deg2rad(-90),
+                np.deg2rad(-90),
+                np.deg2rad(-90),
+            ])
+            indices = np.array([self.articulations.get_joint_index(name) for name in self.rotor_joint_names])
+
+            self.articulations.set_joint_position_targets(
+                positions=positions,
+                joint_indices=indices
+            )
+    
+    def set_zero(self):
+        if self.is_simulation_running:
+            positions = np.array([
+                np.deg2rad(0),
+                np.deg2rad(0),
+                np.deg2rad(0),
+                np.deg2rad(0),
+                np.deg2rad(0),
+                np.deg2rad(0),
+            ])
+            indices = np.array([self.articulations.get_joint_index(name) for name in self.rotor_joint_names])
+
+            self.articulations.set_joint_position_targets(
+                positions=positions,
+                joint_indices=indices
+            )
 
     def on_blade_change(self, model, blade_name):
         if self.articulations is None:
@@ -258,16 +298,17 @@ class AT_Comando(omni.ext.IExt):
         self.forces_to_apply = np.sum(
             bodies_forces, axis = 0
         )
-        # self.pos_blades = np.array(self.pos_blades, dtype=np.float32)
         self.torques_to_apply = np.sum(
             np.cross(self.pos_blades, bodies_forces), axis=0
         )
-        
+        self.torques_to_apply = np.array([0,0,0])
             
     def on_physics_step(self, dt):
-        if self.is_simulation_running:
-            self.rigid_prim.apply_forces_and_torques_at_pos(
-                forces=self.forces_to_apply,
-                torques=self.torques_to_apply,
-                is_global=False
-            )
+        # if self.is_simulation_running:
+            
+        #     self.rigid_prim.apply_forces_and_torques_at_pos(
+        #         forces=[0,0,21000],
+        #         torques=self.torques_to_apply,
+        #         is_global=False
+        #     )
+        pass
