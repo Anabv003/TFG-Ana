@@ -15,49 +15,68 @@ from isaacsim.core.prims import RigidPrim
 from navsim_utils.extensions_utils import ExtensionUtils
 import numpy as np
 
-
-
-
 class AT_Comando(omni.ext.IExt):
     def on_startup(self, ext_id):
         self.init_vars()
         self.build_ui()
 
-    # def on_shutdown(self):
-    #     pass
+    def on_shutdown(self):
+        self._physx_sub = None
+        self.on_play_sub = None
+        self.on_stop_sub = None
+
+    def on_physics_step(self, dt):
+        if self.is_simulation_running:
+            self.rigid_prim.apply_forces(
+                forces=self.forces_to_apply,
+                is_global=False
+            )
 
     def init_rigid_prim(self):
-        self.rigid_prim = RigidPrim (
-            prim_paths_expr=["/root/Blade*"]
+        blade_paths = [
+        "/root/BladeNW",
+        "/root/BladeNE",
+        "/root/BladeW",
+        "/root/BladeE",
+        "/root/BladeSW",
+        "/root/BladeSE",
+       ]
+
+        self.rigid_prim = RigidPrim(
+            prim_paths_expr=blade_paths
         )
         self.rigid_prim.initialize()
 
-    def joints(self):
+        for i, prim in enumerate(self.rigid_prim.prims):
+            name = prim.GetName()
+            self.blade_prim_to_index[name] = i
+            self.blade_prims_order_names.append(name)
+            self.blade_prims_order_index.append(i)
+        self.force_to_apply = np.zeros((self.rigid_prim.count, 3), dtype=np.float32)
+        # self.force_to_apply[:, 2] = self.hover_force / self.rigid_prim.count
+        self.gravity_prim_force = self.hover_force / self.rigid_prim.count
+
+    def init_articulation_root(self):
 
         self.articulations = Articulation(
             prim_paths_expr=["/root"]
         )
         self.articulations.initialize()
 
-        print(self.articulations.joint_names)
-
     def on_timeline_play(self, event):
         if not self.is_simulation_running:
-            self.joints()
+            self.init_articulation_root()
             self.init_rigid_prim()
             self.is_simulation_running = True
+            #self.set_ninety()
     
     def on_timeline_stop(self, event):
         if self.is_simulation_running:
             self.articulations = None 
-            if self._physx_sub is not None:
-                self._physx_sub.unsubscribe()
-                self._physx_sub = None
+            self.rigid_prim = None
             self.is_simulation_running = False
-            self.rigid_prim= None
 
-            self.forces_to_apply = [0,0,0]
-            self.torques_to_apply = [0,0,0]
+            self.forces_to_apply = np.zeros((6, 3))
 
     def init_vars(self):
 
@@ -73,32 +92,36 @@ class AT_Comando(omni.ext.IExt):
         self.rotor_angles = {}
         self.blade_speed = {}
 
-        self.forces_to_apply = [0,0,0]
-        self.torques_to_apply = [0,0,0]
+        self.blade_prim_name = ["BladeNW","BladeNE","BladeW","BladeE","BladeSW","BladeSE"]
+        self.blade_prim_to_index = {}
+        self.blade_prims_order_names = []
+        self.blade_prims_order_index = []
+
+        self.forces_to_apply = np.zeros((6, 3), dtype=np.float32)
+        self.torques_to_apply = np.zeros((6, 3), dtype=np.float32)
         self._physx_sub = None
         self.rotor_sliders = {}
         self.blade_sliders = {}
         self.force_fields = {}
+        
 
+        self.mass = 2002
+        self.hover_force = 9.81 * self.mass
+        self.gravity_prim_force = 0
+        self.noventa = False
         self.current_joint_positions = None
 
-        #X, Y, Z
-        self.pos_blades= [[5.9732, 2.33, 1.8101], #BladeNW
-                          [5.9732, -2.33, 1.8101],#BladeNE
-                          [4.1579,5.3019,1.8036],#BladeW
-                          [4.1579,-5.3019,1.8036],#BladeE
-                          [1.216,2.33,2.539],#BladeSW
-                          [1.216,-2.33,2.539]]#BladeSE
-        
-        self.pos_rotor = [[5.9768, 2.33, 1.3128], #RotorNW
-                          [5.9768, -2.33, 1.3128],#RotorNE
-                          [4.1288,5.3645,1.019],#RotorW
-                          [4.1288,-5.3645,1.019],#RotorE
-                          [1.2019,2.33,1.9648],#RotorSW
-                          [1.2019,-2.33,1.9648]]#RotorSE
 
+        self.wait_after_ninety = 2.5
+        self.wait_timer = 0.0
+        self.waiting_for_rotors = False
+        self.noventa = False
+        
+
+
+        self.apply_forces_enabled = False
         # Phyxs callback
-        self.physx_sub = omni.physx.acquire_physx_interface().subscribe_physics_step_events(
+        self._physx_sub = omni.physx.acquire_physx_interface().subscribe_physics_step_events(
             self.on_physics_step
         )
 
@@ -176,7 +199,7 @@ class AT_Comando(omni.ext.IExt):
                                     
                                     slider = ui.FloatSlider(
                                         min=0, 
-                                        max=120,
+                                        max=110,
                                         step=2,
                                         precision=1,
                                         style={
@@ -199,7 +222,7 @@ class AT_Comando(omni.ext.IExt):
                     )
                     with self.blade_forces:
                         with ui.VStack(style={"margin": 1}, height=0, spacing=5):
-                            for blade_name in self.blade_joint_names:
+                            for blade_name in self.blade_prim_name:
                                 with ui.HStack(alignment=ui.Alignment.RIGHT):
                                     ui.Label(blade_name)
                                     
@@ -210,11 +233,13 @@ class AT_Comando(omni.ext.IExt):
                                         }
                                     
                                     )
-                                    self.force_fields[blade_name].model.set_value(3500)
+                                    self.force_fields[blade_name].model.set_value(3273.27)
                             
-                            #Añadir botón
+                            ui.Button(text="Set Upward forces", clicked_fn=self.set_upward_forces)
+                            
                             force_send_button = ui.Button(clicked_fn = self.send_forces, text = "Send forces")
 
+    # Rotors Angles
     def on_rotor_change(self, model, rotor_name):
         if self.articulations is None:
             return
@@ -267,6 +292,7 @@ class AT_Comando(omni.ext.IExt):
                 joint_indices=indices
             )
 
+    # Blade Speeds
     def on_blade_change(self, model, blade_name):
         if self.articulations is None:
             return
@@ -288,27 +314,18 @@ class AT_Comando(omni.ext.IExt):
             joint_indices=np.array([idx])
         )
 
+    # Blade Forces
+    def set_upward_forces(self):
+        for name in self.blade_prim_name:
+            self.force_fields[name].model.set_value(3273.27 * 1.1)
+    
     def send_forces(self):
-        bodies_forces = np.zeros((6, 3))
+        for blade_name in self.blade_prim_name:
+            index = self.blade_prim_to_index[blade_name]
+            self.forces_to_apply[index, 2] = self.force_fields[blade_name].model.get_value_as_float()
+            
+        self.forces_to_apply[:, 2] -= self.gravity_prim_force
+        print(self.forces_to_apply)
         
-        #Fuerzas de cada joint
-        for i, name  in enumerate(self.blade_joint_names) : 
-            bodies_forces[i, 2] =  self.force_fields[name].model.get_value_as_float()
-
-        self.forces_to_apply = np.sum(
-            bodies_forces, axis = 0
-        )
-        self.torques_to_apply = np.sum(
-            np.cross(self.pos_blades, bodies_forces), axis=0
-        )
-        self.torques_to_apply = np.array([0,0,0])
+                
             
-    def on_physics_step(self, dt):
-        # if self.is_simulation_running:
-            
-        #     self.rigid_prim.apply_forces_and_torques_at_pos(
-        #         forces=[0,0,21000],
-        #         torques=self.torques_to_apply,
-        #         is_global=False
-        #     )
-        pass
