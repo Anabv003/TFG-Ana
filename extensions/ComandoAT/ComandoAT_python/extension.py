@@ -34,12 +34,12 @@ class AT_Comando(omni.ext.IExt):
 
     def init_rigid_prim(self):
         blade_paths = [
-        "/root/BladeNW",
-        "/root/BladeNE",
-        "/root/BladeW",
-        "/root/BladeE",
-        "/root/BladeSW",
-        "/root/BladeSE",
+        "/AeroTaxi/BladeNW",
+        "/AeroTaxi/BladeNE",
+        "/AeroTaxi/BladeW",
+        "/AeroTaxi/BladeE",
+        "/AeroTaxi/BladeSW",
+        "/AeroTaxi/BladeSE",
        ]
 
         self.rigid_prim = RigidPrim(
@@ -59,7 +59,7 @@ class AT_Comando(omni.ext.IExt):
     def init_articulation_root(self):
 
         self.articulations = Articulation(
-            prim_paths_expr=["/root"]
+            prim_paths_expr=["/AeroTaxi"]
         )
         self.articulations.initialize()
 
@@ -199,7 +199,7 @@ class AT_Comando(omni.ext.IExt):
                                     
                                     slider = ui.FloatSlider(
                                         min=0, 
-                                        max=110,
+                                        max=90,
                                         step=2,
                                         precision=1,
                                         style={
