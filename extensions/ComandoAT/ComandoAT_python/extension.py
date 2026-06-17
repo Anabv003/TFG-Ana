@@ -29,7 +29,7 @@ class AT_Comando(omni.ext.IExt):
         if self.is_simulation_running:
             self.rigid_prim.apply_forces(
                 forces=self.forces_to_apply,
-                is_global=False
+                is_global=True
             )
 
     def init_rigid_prim(self):
@@ -189,7 +189,7 @@ class AT_Comando(omni.ext.IExt):
                     #Poner cada pala a una velocidad diferente
                     self.blade_speeds = ui.CollapsableFrame(
                         title="Blade Speed", 
-                        collapsed=True
+                        collapsed=False
                     )
                     with self.blade_speeds:
                         with ui.VStack(style={"margin": 1}, height=0, spacing=5):
@@ -199,7 +199,7 @@ class AT_Comando(omni.ext.IExt):
                                     
                                     slider = ui.FloatSlider(
                                         min=0, 
-                                        max=90,
+                                        max=500,
                                         step=2,
                                         precision=1,
                                         style={
@@ -215,7 +215,9 @@ class AT_Comando(omni.ext.IExt):
                                     )
 
                                     self.blade_sliders[blade_name] = slider
-                    
+                            with ui.HStack():
+                                self.velocity = ui.FloatField()
+                                button_mandarcosi = ui.Button(clicked_fn = self.set_velocity, text = "Set velocity")
                     self.blade_forces = ui.CollapsableFrame(
                         title="Blade Force", 
                         collapsed=False
@@ -292,6 +294,17 @@ class AT_Comando(omni.ext.IExt):
                 joint_indices=indices
             )
 
+    def set_velocity(self):
+        vel_value = self.velocity.model.get_value_as_float()
+        velocity = np.zeros((6))
+        velocity[:] = vel_value
+        # ["JBladeNW","JBladeNE","JBladeW","JBladeE","JBladeSW","JBladeSE"]
+        velocity[[1,2,4]] *= -1
+        
+        for blade_name, vel in zip(self.blade_joint_names, velocity):
+            self.apply_blade_vel(blade_name, vel)
+        
+        
     # Blade Speeds
     def on_blade_change(self, model, blade_name):
         if self.articulations is None:

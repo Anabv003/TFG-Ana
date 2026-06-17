@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 root_navsim_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../..'))
 
@@ -7,15 +5,10 @@ root_navsim_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 
 import math
 import torch
-from scipy.spatial.transform import Rotation
 
 import isaaclab.envs.mdp as mdp
 from isaaclab.markers import VisualizationMarkersCfg, VisualizationMarkers
 import isaaclab.sim as sim_utils
-# para la flecha
-# -------------------------------------------------
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-# -------------------------------------------------
 from isaaclab.assets import AssetBaseCfg, Articulation, ArticulationCfg
 from isaaclab.envs import ManagerBasedRLEnv, ManagerBasedRLEnvCfg
 from isaaclab.managers import ActionTermCfg, ActionTerm
@@ -30,9 +23,9 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
 from isaaclab.actuators import DCMotorCfg
 import isaaclab.utils.math as math_utils
+
 from . import rewards as my_rewards
 from . import terminations as my_terminations
-from .flight_plan import FlightPlan
 # ruido gaussiano para la regularización -- Teresa ---
 from isaaclab.utils.noise import GaussianNoiseCfg
 # para las flechas
@@ -42,22 +35,26 @@ from isaaclab.utils.math import quat_from_matrix
 # |---------------------------------------------------------|
 # |--------------------- ACTIONS ---------------------------|
 # |---------------------------------------------------------|
-
-class AeroTaxiActionTerm(ActionTerm):
+class JobyActionTerm(ActionTerm):
     """Action term for the UAV."""
 
     _asset: Articulation
     _env: ManagerBasedRLEnv
 
-    def __init__(self, cfg: AeroTaxiActionTermCfg, env: ManagerBasedRLEnv):
+    def __init__(self, cfg: JobyActionTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
-        self._raw_actions = torch.zeros(env.num_envs, 12, device=self.device)#Salida
-        self._processed_actions = torch.zeros(env.num_envs, 12, 3, device=self.device) #Salidas procesadas (calcular)
-        self.vel_to_thrust = torch.zeros(env.num_envs, 6, 3, device=self.device)
-        self.max_prim_links = 13 # 6 rotors + 6 blade+ 1 body
-        self.forces_to_apply = torch.zeros(env.num_envs, self.max_prim_links)
-        self.gravity = (self.current_mass * 9.81) / 6
-
+        # NN outputs: 12 (6 rotor orientations + 6 blade speeds)
+        self._raw_actions = torch.zeros(env.num_envs, 12, device=self.device)
+        # Processed actions: orientations and forces to apply (6 rotors + 6 blades)
+        self._processed_actions = torch.zeros(env.num_envs, 12, device=self.device)
+        # Maximum number of links (1 body + 6 rotors + 6 blades)
+        self.max_prim_links = 13
+        # Number of rotors
+        self.num_rotors = 6
+        # Hover omega (rad/s)
+        self.hover_vel = 80
+        # Pre-allocate forces tensor for all environments and links (body + rotors + blades)
+        self.forces_to_apply = torch.zeros(env.num_envs, self.max_prim_links, 3, device=self.device)
 
         # Create all positions at once in a single tensor operation
         #poner rotores,blades y bodys
@@ -86,9 +83,7 @@ class AeroTaxiActionTerm(ActionTerm):
         # Create indexes efficiently
         self.indexes = torch.arange(env.num_envs, device=self.device)
 
-        self._asset = env.scene[cfg.asset_name]
-
-
+        # self._asset = env.scene[cfg.asset_name]
 
     @property
     def action_dim(self) -> int:
@@ -105,138 +100,73 @@ class AeroTaxiActionTerm(ActionTerm):
     def process_actions(self, actions: torch.Tensor):
         # actions contiene la orientación de los rotores y la velocidad de las palas
         # Si algun dron reventó y el NaN se cuela, lo ponemos a 0
-
-        mass = self._asset.data.default_mass.sum(dim=1, keepdim=True)
+        # Evitar que valores inválidos lleguen a la simulación, poniendo los valores entre -1 y 1
+        #esto deberia ser 6 para la orientacion dde los rotores y 6 para la velocidad
+        actions = torch.clamp(actions, -1.0, 1.0)
+        actions = torch.nan_to_num(actions, nan=0.0)
+        
+        # Las acciones producidas por la red están normalizadas (cambiarlo entre 0 y 90)
+        #actions = torch.clamp(actions, -0, 1.0)
+        
+        # Guardar las 12 acciones originales:
+        # 0:6  -> orientación de los rotores
+        # 6:12 -> velocidad de las palas
+        # self._raw_actions[:] = actions
+        
+        # Calcular el peso del aerotaxi
+        mass = self._asset.data._root_physx_view.get_masses().sum(dim=1, keepdim = True)
         mg = mass * 9.81
-
-        # posiciones rotores (sin el cuerpo)
-        rotor_pos = self.positions[:, 1:5, :]  # (envs,4,3)
-        x = rotor_pos[:, :, 0]
-        y = rotor_pos[:, :, 1]
-
-        # coeficientes
-        kFT = torch.tensor([4.6544, 4.6544, 0.9309, 0.9309], device=self.device)
-        kMDR = torch.tensor([5.9683, -5.9683, 1.4921, -1.4921], device=self.device)
-        # signos alternados como en tu fórmula yaw
-
-        # Construir matriz A para cada env
-        A = torch.zeros(self._env.num_envs, 4, 4, device=self.device)
-
-        # Fuerza total
-        A[:, 0, :] = kFT
-
-        # Momento X (roll)
-        A[:, 1, :] = y * kFT
-
-        # Momento Y (pitch)
-        A[:, 2, :] = -x * kFT
-
-        # Momento Z (yaw)
-        A[:, 3, :] = kMDR
-
-        # Vector objetivo
-        b = torch.zeros(self._env.num_envs, 4, device=self.device)
-        b[:, 0] = mg.squeeze()
-
-        # Resolver sistema
-        u_hover = torch.linalg.solve(A, b)
-
-        # Asegurar positivo
-        u_hover = torch.clamp(u_hover, min=0.0)
-
-        omega_hover = torch.sqrt(u_hover)
-        thrust_scale = 0.5
-        self._raw_actions = omega_hover * (1.0 + thrust_scale * actions)
-        self._raw_actions = torch.clamp(self._raw_actions, min=0.0)
-        # ------------------------------------------------------
-
-        kFT_N = torch.tensor(4.6544, device=self.device)
-        kFT_S = torch.tensor(0.9309, device=self.device)
-        kFDx = torch.tensor(3.0625, device=self.device)
-        kFDy = torch.tensor(4.0000, device=self.device)
-        kFDz = torch.tensor(7.8400, device=self.device)
-        kMDR_N = torch.tensor(5.9683, device=self.device)
-        kMDR_S = torch.tensor(1.4921, device=self.device)
-        kMDx = torch.tensor(37.4010, device=self.device)
-        kMDy = torch.tensor(25.8580, device=self.device)
-        kMDz = torch.tensor(20.2514, device=self.device)
-        torch_2 = torch.tensor(2, device=self.device)
         
-        # # Process raw actions (vectorized)
-        # -----------------------------------------------
-        # self._raw_actions = actions.abs() * self.action_scale
-        # -----------------------------------------------
+        # Calcular k usando la condición de hover        
+        k = mg / torch.square(self.hover_vel)
+        
+        # De momento se almacenan las orientaciones sin utilizarlas
+        self._processed_actions[:, 0:6] = self._raw_actions[:, 0:6]
 
-        # print(f"[DEBUG]: raw_actions: {self._raw_actions[0]}")
-        
-        # Get velocities (assuming these are already tensors)
-        lin_vels = torch.nan_to_num(self._asset.data.root_com_lin_vel_b, nan=0.0, posinf=0.0, neginf=0.0)
-        ang_vels = torch.nan_to_num(self._asset.data.root_com_ang_vel_b, nan=0.0, posinf=0.0, neginf=0.0)
-        # lin_vels = self._env.observation_manager._obs_buffer["policy"][:, :3]  # shape: (num_envs, 3)
-        # ang_vels = self._env.observation_manager._obs_buffer["policy"][:, 6:9]  # shape: (num_envs, 3)
-        
-        # Compute thrust forces (vectorized)
-        thrust_coeffs = torch.tensor([kFT_N, kFT_N, kFT_S, kFT_S], device=self.device)
-        thrust_z = thrust_coeffs * self._raw_actions**torch_2
-        # evito que la componente z sea infinita
-        thrust_z = torch.clamp(thrust_z, max=12000.0) # antes 5000 N, pero es insuficiente para 2200 kilos
-        FT_all = torch.zeros(self._env.num_envs, 4, 3, device=self.device)
-        FT_all[:, :, 2] = thrust_z  # Only z-component is non-zero
-        
-        # Compute drag forces (vectorized)
-        FD = -torch.stack([kFDx, kFDy, kFDz]) * lin_vels * lin_vels.abs()
-        # limito resistencia al aire
-        FD = torch.clamp(FD, -5000.0, 5000.0)
+        # Apply 'vel to thrust' formula (T = k * omega^2)
+        self._processed_actions[:, 6:12] = k * torch.square(self._raw_actions[:, 6:12])
 
-
-        # Compute drag moments (vectorized)
-        MDR_coeffs = torch.tensor([kMDR_N, kMDR_N, kMDR_S, kMDR_S], device=self.device)
-        MDR_z = MDR_coeffs * self._raw_actions**torch_2
-        MDR = torch.zeros(self._env.num_envs, 3, device=self.device)
-        MDR[:, 2] = MDR_z[:, 1] - MDR_z[:, 0] - MDR_z[:, 3] + MDR_z[:, 2]  # NE-NW-SE+SW
+        # Assign forces to the correct links (body + rotors + blades) at Z axis
+        self.forces_to_apply[:, 7:13, 2] = self._processed_actions[:, 6:12] - mg / self.num_rotors
         
-        # Compute friction moments (vectorized)
-        MD = -torch.stack([kMDx, kMDy, kMDz]) * ang_vels * ang_vels.abs()
-        # Combine moments (vectorized) and limit it
-        torque = torch.clamp(MDR + MD, -5000.0, 5000.0)
         
-        zero_torque = torch.zeros_like(torque)
-        
-        # Build processed actions tensor (vectorized)
-        self._processed_actions[:, 0] = FD  # Drag force
-        self._processed_actions[:, 1] = FT_all[:, 0]  # FT_NW
-        self._processed_actions[:, 2] = FT_all[:, 1]  # FT_NE
-        self._processed_actions[:, 3] = FT_all[:, 2]  # FT_SW
-        self._processed_actions[:, 4] = FT_all[:, 3]  # FT_SE
-        self._processed_actions[:, 5] = torque  # Combined torque
-        self._processed_actions[:, 6:] = zero_torque.unsqueeze(1).expand(-1, 4, -1)  # Zero torques
 
     def apply_actions(self):
         self._asset.root_physx_view.apply_forces_and_torques_at_position(
-            force_data=self._processed_actions[:, :self.max_prim_links, :], 
+            force_data=self.forces_to_apply, 
             position_data=self.positions,
             indices=self.indexes,
             is_global=False
         )
 
-        # This can be used to simulate wind forces it seems
-        # mdp.apply_external_force_torque()
-
 @configclass
-class AeroTaxiActionTermCfg(ActionTermCfg):
+class JobyActionTermCfg(ActionTermCfg):
     """Action term configuration for the UAV."""
 
-    class_type: type = AeroTaxiActionTerm
+    class_type: type = JobyActionTerm
     """Class type of the action term."""
 
 @configclass
 class ActionsCfg:
     """Action specifications for the environment."""
-    joint_efforts = mdp.JointEffortActionCfg(
-        asset_name = "AeroTaxi", 
-        joint_names = ["JRotorNW","JRotorNE","JRotorW","JRotorE","JRotorSW","JRotorSE","JBladeNW","JBladeNE","JBladeW","JBladeE","JBladeSW","JBladeSE"]
-        )
-    rotors_vel = AeroTaxiActionTermCfg(asset_name="AeroTaxi")
+    # joint_efforts = mdp.JointEffortActionCfg(
+    #     asset_name = "Joby", 
+    #     joint_names = [
+    #         "JRotorNW",
+    #         "JRotorNE",
+    #         "JRotorW",
+    #         "JRotorE",
+    #         "JRotorSW",
+    #         "JRotorSE",
+    #         "JBladeNW",
+    #         "JBladeNE",
+    #         "JBladeW",
+    #         "JBladeE",
+    #         "JBladeSW",
+    #         "JBladeSE"
+    #     ]
+    # )
+    rotor_ori_and_blade_vel = JobyActionTermCfg(asset_name="Joby")
 
 
 # |---------------------------------------------------------|
@@ -286,6 +216,16 @@ def my_obs_height(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg):
     altura_z = uav_pos_local[:, 2:3]
     return altura_z
 
+#ToDo
+def my_obs_get_command(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg):
+    asset = env.scene["Joby"]
+    command_term = env.command_manager.get_term("vel_command")
+    target_vel_w = command_term.target_vel 
+    quat_inv = math_utils.quat_inv(asset.data.root_com_quat_w)
+    target_vel_b = math_utils.quat_apply(quat_inv, target_vel_w)
+    
+    return target_vel_b
+
 def my_obs_lin_vel(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg):
     asset: Articulation = env.scene[asset_cfg.name]
     return asset.data.root_com_lin_vel_b
@@ -311,7 +251,7 @@ def my_obs_pitch(env:ManagerBasedRLEnv, asset_cfg: SceneEntityCfg):
     return pitch
 
 def my_obs_target_vel(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg):
-    asset = env.scene["AeroTaxi"]
+    asset = env.scene["Joby"]
     command_term = env.command_manager.get_term("vel_command")
     target_vel_w = command_term.target_vel 
     quat_inv = math_utils.quat_inv(asset.data.root_com_quat_w)
@@ -353,7 +293,7 @@ def my_obs_yaw_error(env:ManagerBasedRLEnv, asset_cfg: SceneEntityCfg):
 
 def my_obs_target_ang_vel(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg):
     """Velocidad angular deseada en el frame del dron (body frame)."""
-    asset = env.scene["AeroTaxi"]
+    asset = env.scene["Joby"]
     command_term = env.command_manager.get_term("vel_command")
     zeros = torch.zeros_like(command_term.target_pos) # [N, 3]
     zeros[:, 2] = command_term.target_yaw # Ponemos el comando en la componente Z
@@ -367,7 +307,7 @@ def my_obs_target_ang_vel(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg):
 
 def my_obs_target_pos(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg):
     """Vector hacia el objetivo relativo al dron, sin dar la posición absoluta de entrenamiento."""
-    asset = env.scene["AeroTaxi"]
+    asset = env.scene["Joby"]
     command_term = env.command_manager.get_term("vel_command")
     target_pos_w = command_term.target_pos
     current_pos_w = asset.data.root_com_pos_w[:, :3]
@@ -403,25 +343,26 @@ class ObervervationCfg:
     @configclass
     class PolicyCfg(ObsGroup):
         """Observation group for the policy."""
-        # dist = ObsTerm(func=my_obs_dist2, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")},noise=GaussianNoiseCfg(std=0.01))
-        lin_vel = ObsTerm(func=my_obs_lin_vel, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")},noise=GaussianNoiseCfg(std=0.05))
-        ang_vel = ObsTerm(func=my_obs_ang_vel, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")},noise=GaussianNoiseCfg(std=0.05))
-        projected_gravity = ObsTerm(func=my_obs_projected_gravity, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")},noise=GaussianNoiseCfg(std=0.01))
-        target_vel = ObsTerm(func=my_obs_target_vel, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")},noise=GaussianNoiseCfg(std=0.01)) 
-        target_future = ObsTerm(func=my_obs_target_future, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")},noise=GaussianNoiseCfg(std=0.01))
-        # pos = ObsTerm(func=my_obs_pos, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")},noise=GaussianNoiseCfg(std=0.01))
-        yaw_error = ObsTerm(func=my_obs_yaw_error, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")},noise=GaussianNoiseCfg(std=0.01))
-        # target_yaw_rate = ObsTerm(func=my_obs_target_yaw_rate, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")},noise=GaussianNoiseCfg(std=0.01))
-        # prev_action = ObsTerm(func=my_obs_prev_action, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
-        # roll = ObsTerm(func=my_obs_roll, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")},noise=GaussianNoiseCfg(std=0.01))
-        # pitch = ObsTerm(func=my_obs_pitch, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")},noise=GaussianNoiseCfg(std=0.01))
-        # yaw = ObsTerm(func=my_obs_yaw, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")},noise=GaussianNoiseCfg(std=0.01))
+        # dist = ObsTerm(func=my_obs_dist2, params={"asset_cfg": SceneEntityCfg(name="Joby")},noise=GaussianNoiseCfg(std=0.01))
+        command = ObsTerm(func=my_obs_get_command, params={"asset_cfg": SceneEntityCfg(name="Joby")},noise=GaussianNoiseCfg(std=0.05))
+        lin_vel = ObsTerm(func=my_obs_lin_vel, params={"asset_cfg": SceneEntityCfg(name="Joby")},noise=GaussianNoiseCfg(std=0.05))
+        ang_vel = ObsTerm(func=my_obs_ang_vel, params={"asset_cfg": SceneEntityCfg(name="Joby")},noise=GaussianNoiseCfg(std=0.05))
+        projected_gravity = ObsTerm(func=my_obs_projected_gravity, params={"asset_cfg": SceneEntityCfg(name="Joby")},noise=GaussianNoiseCfg(std=0.01))
+        target_vel = ObsTerm(func=my_obs_target_vel, params={"asset_cfg": SceneEntityCfg(name="Joby")},noise=GaussianNoiseCfg(std=0.01)) 
+        # target_future = ObsTerm(func=my_obs_target_future, params={"asset_cfg": SceneEntityCfg(name="Joby")},noise=GaussianNoiseCfg(std=0.01))
+        # pos = ObsTerm(func=my_obs_pos, params={"asset_cfg": SceneEntityCfg(name="Joby")},noise=GaussianNoiseCfg(std=0.01))
+        yaw_error = ObsTerm(func=my_obs_yaw_error, params={"asset_cfg": SceneEntityCfg(name="Joby")},noise=GaussianNoiseCfg(std=0.01))
+        # target_yaw_rate = ObsTerm(func=my_obs_target_yaw_rate, params={"asset_cfg": SceneEntityCfg(name="Joby")},noise=GaussianNoiseCfg(std=0.01))
+        # prev_action = ObsTerm(func=my_obs_prev_action, params={"asset_cfg": SceneEntityCfg(name="Joby")})
+        # roll = ObsTerm(func=my_obs_roll, params={"asset_cfg": SceneEntityCfg(name="Joby")},noise=GaussianNoiseCfg(std=0.01))
+        # pitch = ObsTerm(func=my_obs_pitch, params={"asset_cfg": SceneEntityCfg(name="Joby")},noise=GaussianNoiseCfg(std=0.01))
+        # yaw = ObsTerm(func=my_obs_yaw, params={"asset_cfg": SceneEntityCfg(name="Joby")},noise=GaussianNoiseCfg(std=0.01))
 
         # current_command = ObsTerm(func=my_obs_command) # habría fuga de datos si no
         # GaussianNoiseCFG: simula el ruido de los sensores, así es como si fuera Regularización
-        # target_pos = ObsTerm(func=my_obs_target_pos, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
-        # target_ang_vel = ObsTerm(func=my_obs_target_ang_vel, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
-        # height = ObsTerm(func=my_obs_height, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")},noise=GaussianNoiseCfg(std=0.01))
+        # target_pos = ObsTerm(func=my_obs_target_pos, params={"asset_cfg": SceneEntityCfg(name="Joby")})
+        # target_ang_vel = ObsTerm(func=my_obs_target_ang_vel, params={"asset_cfg": SceneEntityCfg(name="Joby")})
+        # height = ObsTerm(func=my_obs_height, params={"asset_cfg": SceneEntityCfg(name="Joby")},noise=GaussianNoiseCfg(std=0.01))
 
         def __post_init__(self):
             self.enable_corruption = True  # Regularización con ruido en las observaciones
@@ -432,33 +373,32 @@ class ObervervationCfg:
     # Crítico: la corrección que se hará sobre lo que ve el dron en train. En test no hay crítico
     # Por eso aquí vamos a incluir la velocidad del punto guía, para que pueda ajustarse a ella en train, pero en test no
     # la vea
-
-
     @configclass
     class CriticCfg(ObsGroup):
         """Lo que el entrenador sabe (la verdad absoluta, sin ruido)"""
         # 1. Posición y velocidad de la Policy (pero sin ruido)
-        # pos = ObsTerm(func=my_obs_pos, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
-        # dist = ObsTerm(func=my_obs_dist2, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
-        lin_vel = ObsTerm(func=my_obs_lin_vel, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
-        ang_vel = ObsTerm(func=my_obs_ang_vel, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
-        projected_gravity = ObsTerm(func=my_obs_projected_gravity, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
-        target_vel = ObsTerm(func=my_obs_target_vel, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
-        target_future = ObsTerm(func=my_obs_target_future, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
-        yaw_error = ObsTerm(func=my_obs_yaw_error, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
-        # target_yaw_rate = ObsTerm(func=my_obs_target_yaw_rate, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
-        # roll = ObsTerm(func=my_obs_roll, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
-        # pitch = ObsTerm(func=my_obs_pitch, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
-        # yaw = ObsTerm(func=my_obs_yaw, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
+        # pos = ObsTerm(func=my_obs_pos, params={"asset_cfg": SceneEntityCfg(name="Joby")})
+        # dist = ObsTerm(func=my_obs_dist2, params={"asset_cfg": SceneEntityCfg(name="Joby")})
+        command = ObsTerm(func=my_obs_get_command, params={"asset_cfg": SceneEntityCfg(name="Joby")})
+        lin_vel = ObsTerm(func=my_obs_lin_vel, params={"asset_cfg": SceneEntityCfg(name="Joby")})
+        ang_vel = ObsTerm(func=my_obs_ang_vel, params={"asset_cfg": SceneEntityCfg(name="Joby")})
+        projected_gravity = ObsTerm(func=my_obs_projected_gravity, params={"asset_cfg": SceneEntityCfg(name="Joby")})
+        target_vel = ObsTerm(func=my_obs_target_vel, params={"asset_cfg": SceneEntityCfg(name="Joby")})
+        # target_future = ObsTerm(func=my_obs_target_future, params={"asset_cfg": SceneEntityCfg(name="Joby")})
+        yaw_error = ObsTerm(func=my_obs_yaw_error, params={"asset_cfg": SceneEntityCfg(name="Joby")})
+        # target_yaw_rate = ObsTerm(func=my_obs_target_yaw_rate, params={"asset_cfg": SceneEntityCfg(name="Joby")})
+        # roll = ObsTerm(func=my_obs_roll, params={"asset_cfg": SceneEntityCfg(name="Joby")})
+        # pitch = ObsTerm(func=my_obs_pitch, params={"asset_cfg": SceneEntityCfg(name="Joby")})
+        # yaw = ObsTerm(func=my_obs_yaw, params={"asset_cfg": SceneEntityCfg(name="Joby")})
         # La nueva función del target también necesita saber respecto a qué dron rotar
-        # height = ObsTerm(func=my_obs_height, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
+        # height = ObsTerm(func=my_obs_height, params={"asset_cfg": SceneEntityCfg(name="Joby")})
         # target_vel = ObsTerm(
         #     func=my_obs_target_vel, 
-        #     params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")}
+        #     params={"asset_cfg": SceneEntityCfg(name="Joby")}
         # )
-        # target_pos = ObsTerm(func=my_obs_target_pos, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
-        # target_ang_vel = ObsTerm(func=my_obs_target_ang_vel, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
-        # prev_action = ObsTerm(func=my_obs_prev_action, params={"asset_cfg": SceneEntityCfg(name="AeroTaxi")})
+        # target_pos = ObsTerm(func=my_obs_target_pos, params={"asset_cfg": SceneEntityCfg(name="Joby")})
+        # target_ang_vel = ObsTerm(func=my_obs_target_ang_vel, params={"asset_cfg": SceneEntityCfg(name="Joby")})
+        # prev_action = ObsTerm(func=my_obs_prev_action, params={"asset_cfg": SceneEntityCfg(name="Joby")})
 
         def __post_init__(self):
             self.enable_corruption = False # El crítico no necesita ruido
@@ -485,7 +425,7 @@ class UAVcommandTerm(CommandTerm):
         self._marker_visualizer = VisualizationMarkers(VISUAL_TARGET_CFG)
         self._marker_visualizer_green = VisualizationMarkers(GREEN_ARROW_CFG)
         self._marker_visualizer_red = VisualizationMarkers(RED_ARROW_CFG)
-        self._asset = env.scene[cfg.asset_name]
+        # self._asset = env.scene[cfg.asset_name]
         
         # ponemos la velocidad y giro al que deberá ir nuestro punto guía
         # velocidad en x,y,z (tamaño 3)
@@ -674,13 +614,13 @@ class UAVcommandTermCfg(CommandTermCfg):
 
     class_type: type = UAVcommandTerm
     """Class type of the command term."""
-    asset_name: str = "AeroTaxi"
+    asset_name: str = "Joby"
 
 @configclass
 class CommandCfg:
     """Command specifications for the environment."""
     
-    vel_command = UAVcommandTermCfg(asset_name="AeroTaxi",resampling_time_range=(25, 25)) # cada 25 segundos cambiamos
+    vel_command = UAVcommandTermCfg(asset_name="Joby",resampling_time_range=(25, 25)) # cada 25 segundos cambiamos
 
 
 # |---------------------------------------------------------|
@@ -709,7 +649,7 @@ class EventCfg:
                 "y": (-0.5, 0.5),
                 "z": (-0.5, 0.5)
             },
-            "asset_cfg": SceneEntityCfg(name="AeroTaxi")
+            "asset_cfg": SceneEntityCfg(name="Joby")
         }
     )
 
@@ -718,7 +658,7 @@ class EventCfg:
         func=mdp.randomize_rigid_body_mass,
         mode="reset",
         params={
-            "asset_cfg": SceneEntityCfg(name="AeroTaxi"),
+            "asset_cfg": SceneEntityCfg(name="Joby"),
             "mass_distribution_params": (0.9, 1.1), 
             "operation": "scale"
         }
@@ -728,7 +668,7 @@ class EventCfg:
         func=mdp.push_by_setting_velocity,
         mode="reset",
         params={
-            "asset_cfg": SceneEntityCfg(name="AeroTaxi"),
+            "asset_cfg": SceneEntityCfg(name="Joby"),
             "velocity_range": {
                 "x": (-1.0, 1.0), 
                 "y": (-1.0, 1.0),
@@ -819,10 +759,10 @@ class MySceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.GroundPlaneCfg(size=(6000, 6000))
     )
 
-    AeroTaxi: ArticulationCfg = ArticulationCfg(
-        prim_path="{ENV_REGEX_NS}/AeroTaxi",
+    Joby: ArticulationCfg = ArticulationCfg(
+        prim_path="{ENV_REGEX_NS}/Joby",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=os.path.abspath(os.path.join(root_navsim_path, "isaac_lab", "AeroTaxi", "UAM_AeroTaxi_lab.usd")),
+            usd_path=os.path.abspath(os.path.join(root_navsim_path, "isaac_lab", "Joby", "UAM_Joby_lab.usd")),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=True,
                 rigid_body_enabled=True,
@@ -833,64 +773,132 @@ class MySceneCfg(InteractiveSceneCfg):
             ),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=False,
-                solver_position_iteration_count=4,
-                solver_velocity_iteration_count=0,
+                solver_position_iteration_count=16,
+                solver_velocity_iteration_count=16,
                 sleep_threshold=0.005,
                 stabilization_threshold=0.001,
             ),
         ),
-        #CAMBIAR ESTO
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0, 0, 1.75),
+            pos=(0, 0, 20),
             joint_pos={
-                "NW_joint": 0.0,
-                "NE_joint": 0.0,
-                "SW_joint": 0.0,
-                "SE_joint": 0.0,
+                "JRotorNW": 0,
+                "JRotorNE": 0,
+                "JRotorW": 0,
+                "JRotorE": 0,
+                "JRotorSW": 0,
+                "JRotorSE": 0,
+                "JBladeNW": 0,
+                "JBladeNE": 0,
+                "JBladeW": 0,
+                "JBladeE": 0,
+                "JBladeSW": 0,
+                "JBladeSE": 0
             },
         ),
         actuators={
-            "NW_rotor": DCMotorCfg(
-                joint_names_expr=["NW_joint"],
+            "JRotorNW": DCMotorCfg(
+                joint_names_expr=["JRotorNW"],
+                effort_limit=5000.0,
+                velocity_limit=1000, 
+                stiffness=500.0,
+                damping=300.0,
+                saturation_effort=8000.0,
+            ),
+            "JRotorNE": DCMotorCfg(
+                joint_names_expr=["JRotorNE"],
                 effort_limit=100000.0,
                 velocity_limit=100000.0,
                 stiffness=0.0,
                 damping=0.0,
                 saturation_effort=100000.0,
             ),
-            "NE_rotor": DCMotorCfg(
-                joint_names_expr=["NE_joint"],
+            "JRotorW": DCMotorCfg(
+                joint_names_expr=["JRotorW"],
                 effort_limit=100000.0,
                 velocity_limit=100000.0,
                 stiffness=0.0,
                 damping=0.0,
                 saturation_effort=100000.0,
             ),
-            "SW_rotor": DCMotorCfg(
-                joint_names_expr=["SW_joint"],
+            "JRotorE": DCMotorCfg(
+                joint_names_expr=["JRotorE"],
                 effort_limit=100000.0,
                 velocity_limit=100000.0,
                 stiffness=0.0,
                 damping=0.0,
                 saturation_effort=100000.0,
             ),
-            "SE_rotor": DCMotorCfg(
-                joint_names_expr=["SE_joint"],
+            "JRotorSW": DCMotorCfg(
+                joint_names_expr=["JRotorSW"],
                 effort_limit=100000.0,
                 velocity_limit=100000.0,
                 stiffness=0.0,
                 damping=0.0,
                 saturation_effort=100000.0,
+            ),
+            "JRotorSE": DCMotorCfg(
+                joint_names_expr=["JRotorSE"],
+                effort_limit=100000.0,
+                velocity_limit=100000.0,
+                stiffness=0.0,
+                damping=0.0,
+                saturation_effort=100000.0,
+            ),
+            "JBladeNW": DCMotorCfg(
+                joint_names_expr=["JBladeNW"],
+                effort_limit=100000.0,
+                velocity_limit=120.0,
+                stiffness=0.0,
+                damping=0.0,
+                saturation_effort=100000.0,
+            ),
+            "JBladeNE": DCMotorCfg(
+                joint_names_expr=["JBladeNE"],
+                effort_limit=100000.0,
+                velocity_limit=120.0,
+                stiffness=0.0,
+                damping=0.0,
+                saturation_effort=100000.0,
+            ),
+            "JBladeW": DCMotorCfg(
+                joint_names_expr=["JBladeW"],
+                effort_limit=100000.0,
+                velocity_limit=120.0,
+                stiffness=0.0,
+                damping=0.0,
+                saturation_effort=100000.0,
+            ),
+            "JBladeE": DCMotorCfg(
+                joint_names_expr=["JBladeE"],
+                effort_limit=100000.0,
+                velocity_limit=120.0,
+                stiffness=0.0,
+                damping=0.0,
+                saturation_effort=100000.0,
+            ),
+            "JBladeSW": DCMotorCfg(
+                joint_names_expr=["JBladeSW"],
+                effort_limit=100000.0,
+                velocity_limit=120.0,
+                stiffness=0.0,
+                damping=0.0,
+                saturation_effort=100000.0,
+            ),
+            "JBladeSE": DCMotorCfg(
+                joint_names_expr=["JBladeSE"],
+                effort_limit=5000.0,
+                velocity_limit=120.0,
+                stiffness=0.0,
+                damping=0.0,
+                saturation_effort=7500.0,
             ),
         }
     )
 
     light = AssetBaseCfg(
         prim_path="/World/light",
-        spawn=sim_utils.DistantLightCfg(
-            color=(0.75, 0.75, 0.75),
-            intensity=30000
-        )
+        spawn=sim_utils.DomeLightCfg()
     )
 
 
@@ -930,9 +938,9 @@ class UAVEnvCfg(ManagerBasedRLEnvCfg):
         self.viewer.eye = [4.5, 0.0, 6.0]
         self.viewer.lookat = [0.0, 0.0, 2.0]
         # step settings
-        self.decimation = 4  # 50 Hz de actualización para la IA
+        self.decimation = 1  # 60 Hz de actualización para la IA
         self.episode_length_s = 25.0 # al ser punto cambiante no debe ser tan largo
         # simulation settings
-        self.sim.dt = 0.005  # 100 Hz para las físicas
+        self.sim.dt = 0.01666  # 60 Hz para las físicas
         self.sim.render_interval = self.decimation
         
