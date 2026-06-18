@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 def rew_attitude_stability3(env):
-    asset = env.scene["AeroTaxi"]
+    asset = env.scene["Joby"]
     roll, pitch, _ = math_utils.euler_xyz_from_quat(asset.data.root_com_quat_w)
     angle_term = torch.exp(-2.0 * (roll**2 + pitch**2))
     return angle_term
@@ -18,7 +18,7 @@ def rew_track_pos(env: ManagerBasedRLEnv):
     term = env.command_manager.get_term("vel_command")
     target_pos = term.target_pos  # XYZ
     
-    asset = env.scene["AeroTaxi"]
+    asset = env.scene["Joby"]
     current_pos_w = asset.data.root_com_pos_w[:, :3]
     current_pos_local = current_pos_w - env.scene.env_origins[:, :3]
 
@@ -26,7 +26,7 @@ def rew_track_pos(env: ManagerBasedRLEnv):
     return torch.exp(-0.05 * error**2) # -0.3 antes
 
 def rew_ang_vel_stability5(env):
-    asset = env.scene["AeroTaxi"]
+    asset = env.scene["Joby"]
     ang_vel = asset.data.root_com_ang_vel_b
 
     # Separar yaw
@@ -38,12 +38,13 @@ def rew_ang_vel_stability5(env):
 
     return 0.7 * term_xy + 0.3 * term_yaw
 
+#ToDo: esto tiene la velocidad objetivo y en la que estoy, por lo que tengo que modificarlo para que sea por los comandos
 def rew_track_vel3(env: ManagerBasedRLEnv):
 
     term = env.command_manager.get_term("vel_command")
     target_vel = term.target_vel[:, :3]
 
-    asset = env.scene["AeroTaxi"]
+    asset = env.scene["Joby"]
     vel = asset.data.root_com_lin_vel_w[:, :3]
 
     vel_norm = torch.norm(vel, dim=1, keepdim=True) + 1e-6
@@ -61,8 +62,7 @@ def rew_action_rate(env):
     return diff
 
 def rew_heading(env):
-
-    asset = env.scene["AeroTaxi"]
+    asset = env.scene["Joby"]
     vel = asset.data.root_com_lin_vel_w[:,:2]
 
     yaw = math_utils.euler_xyz_from_quat(asset.data.root_com_quat_w)[2]
